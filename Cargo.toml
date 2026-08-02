@@ -1,3 +1,6 @@
+[workspace]
+members = ["core"]
+
 [package]
 name = "jwt-service"
 version = "0.1.2"
@@ -14,6 +17,7 @@ name = "jwt_service_cli"
 path = "src/bin.rs"
 
 [dependencies]
+jwt-service-core = { path = "core" }
 axum = "0.8.4"
 backon = "1.6.0"
 base64 = "0.22"

@@ -1145,6 +1145,7 @@ dependencies = [
  "axum",
  "backon",
  "base64 0.22.1",
+ "jwt-service-core",
  "livekit-api",
  "livekit-protocol",
  "reqwest 0.13.2",
@@ -1160,6 +1161,17 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+]
+
+[[package]]
+name = "jwt-service-core"
+version = "0.1.2"
+dependencies = [
+ "base64 0.22.1",
+ "livekit-api",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

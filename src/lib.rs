@@ -8,9 +8,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, options},
 };
-use livekit_api::access_token::VideoGrants;
+
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+
 use std::{collections::HashSet, env, sync::Arc, time::Duration};
 use tracing::{debug, error, info, instrument, trace, warn};
 use url::Url;
@@ -407,7 +407,7 @@ async fn handle_legacy_sfu_request(
     // For legacy requests, derive the room alias using the same method as new requests
     // This ensures compatibility between old and new clients
     let slot_id = "m.call#ROOM";
-    let lk_room_alias = compute_room_alias(&payload.room, slot_id);
+    let lk_room_alias = room_alias(&payload.room, slot_id);
 
     let token = match get_join_token(&state.key, &state.secret, &lk_room_alias, &lk_identity) {
         Ok(t) => t,
@@ -544,14 +544,14 @@ async fn handle_sfu_request(
     );
 
     // Use base64 encoded hash of user_id|device_id|member_id for identity
-    let lk_identity = compute_participant_identity(
+    let lk_identity = participant_identity(
         &user_info.sub,
         &payload.member.claimed_device_id,
         &payload.member.id,
     );
 
     // Use base64 encoded hash of room_id|slot_id for room alias
-    let lk_room_alias = compute_room_alias(&payload.room_id, &payload.slot_id);
+    let lk_room_alias = room_alias(&payload.room_id, &payload.slot_id);
 
     let token = match get_join_token(&state.key, &state.secret, &lk_room_alias, &lk_identity) {
         Ok(t) => t,
@@ -742,112 +742,9 @@ fn is_full_access_user(
     full_access_homeservers.contains(matrix_server_name)
 }
 
-/// `unpadded_base64(sha256(json_serialize(parts)))`, per MSC4195.
-///
-/// The hash input is a compact JSON array matching Go's
-/// `json.Marshal([]string{...})`, and the standard base64 alphabet, not the
-/// URL-safe one. Both details have to match or peers land in different rooms.
-fn hashed_id(parts: &[&str]) -> String {
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
-
-    STANDARD
-        .encode(Sha256::digest(marshal_strings(parts)))
-        .trim_end_matches('=')
-        .to_string()
-}
-/// Serialises like Go's `json.Marshal([]string{...})`.
-///
-/// Go's encoder HTML-escapes `<`, `>` and `&`, and spells backspace and form
-/// feed in the `\u00XX` form. serde_json does neither, so without this an id
-/// containing one of those would hash differently here than in
-/// lk-jwt-service and put peers in different LiveKit rooms.
-fn marshal_strings(parts: &[&str]) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut serializer = serde_json::Serializer::with_formatter(&mut out, GoFormatter);
-
-    parts
-        .serialize(&mut serializer)
-        .expect("serializing a string array to a Vec cannot fail");
-
-    out
-}
-
-struct GoFormatter;
-
-impl serde_json::ser::Formatter for GoFormatter {
-    fn write_string_fragment<W>(&mut self, writer: &mut W, fragment: &str) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        let mut rest = fragment;
-
-        while let Some(at) = rest.find(['<', '>', '&']) {
-            let (before, tail) = rest.split_at(at);
-            let escaped = tail.chars().next().expect("find returns a char boundary");
-
-            writer.write_all(before.as_bytes())?;
-            write!(writer, "\\u{:04x}", escaped as u32)?;
-
-            rest = &tail[escaped.len_utf8()..];
-        }
-
-        writer.write_all(rest.as_bytes())
-    }
-
-    fn write_char_escape<W>(
-        &mut self,
-        writer: &mut W,
-        char_escape: serde_json::ser::CharEscape,
-    ) -> std::io::Result<()>
-    where
-        W: ?Sized + std::io::Write,
-    {
-        use serde_json::ser::CharEscape::{Backspace, FormFeed};
-
-        match char_escape {
-            Backspace => write!(writer, "\\u0008"),
-            FormFeed => write!(writer, "\\u000c"),
-            other => serde_json::ser::Formatter::write_char_escape(
-                &mut serde_json::ser::CompactFormatter,
-                writer,
-                other,
-            ),
-        }
-    }
-}
-
-fn compute_room_alias(room_id: &str, slot_id: &str) -> String {
-    hashed_id(&[room_id, slot_id])
-}
-
-fn compute_participant_identity(user_id: &str, device_id: &str, member_id: &str) -> String {
-    hashed_id(&[user_id, device_id, member_id])
-}
-
-/// `room_create` is never granted: rooms are created server-side via the
-/// RoomService API, which is what Element Call expects with `auto_create: false`.
-#[instrument(skip(api_key, api_secret, room, identity))]
-pub fn get_join_token(
-    api_key: &str,
-    api_secret: &str,
-    room: &str,
-    identity: &str,
-) -> Result<String, livekit_api::access_token::AccessTokenError> {
-    livekit_api::access_token::AccessToken::with_api_key(api_key, api_secret)
-        .with_grants(VideoGrants {
-            room: room.to_string(),
-            room_create: false,
-            room_join: true,
-            can_publish: true,
-            can_subscribe: true,
-            can_update_own_metadata: true,
-
-            ..Default::default()
-        })
-        .with_identity(identity)
-        .with_ttl(Duration::from_secs(60 * 60))
-        .to_jwt()
-}
+// The MSC4195 derivations and token minting live in jwt-service-core so a
+// homeserver can reuse them without this crate's HTTP and OpenID machinery.
+use jwt_service_core::{join_token as get_join_token, participant_identity, room_alias};
 
 pub fn read_key_secret() -> (String, String) {
     let key = env::var("LIVEKIT_KEY")
@@ -942,12 +839,12 @@ pub async fn handle_delegate_delayed_leave(
         return (StatusCode::FORBIDDEN, headers, axum::Json(err)).into_response();
     }
 
-    let lk_identity = compute_participant_identity(
+    let lk_identity = participant_identity(
         &user_info.sub,
         &payload.member.claimed_device_id,
         &payload.member.id,
     );
-    let lk_room_alias = compute_room_alias(&payload.room_id, &payload.slot_id);
+    let lk_room_alias = room_alias(&payload.room_id, &payload.slot_id);
 
     state
         .delegate_delayed_leave(
@@ -1151,97 +1048,6 @@ mod tests {
             .await
             .unwrap();
         assert!(response.status().is_client_error());
-    }
-
-    #[tokio::test]
-    async fn test_get_join_token() {
-        let api_key = "testKey";
-        let api_secret = "testSecret";
-        let room = "testRoom";
-        let identity = "testIdentity@example.com";
-        let token = get_join_token(api_key, api_secret, room, identity).unwrap();
-        assert!(!token.is_empty());
-    }
-
-    #[test]
-    fn test_compute_room_alias_msc4195_vector() {
-        assert_eq!(
-            compute_room_alias("!roomid:example.com", "slot1234"),
-            "O8437W3+jmzMVjoIP3tNwbm+XxHQk2iKpOA7aqw3qSc"
-        );
-    }
-
-    #[test]
-    fn test_compute_participant_identity_msc4195_vector() {
-        assert_eq!(
-            compute_participant_identity("@alice:example.com", "DEVICE123", "memberABC"),
-            "J+T45tGruxc+HrUOqJJlyQSV33m728Cme4+vt8/SWrU"
-        );
-    }
-
-    /// The spec requires the caller to reject a `sub` that is not on the
-    /// server it queried; without it any host can vouch for anyone.
-    #[test]
-    fn user_id_server_name_extracts_the_domain() {
-        assert_eq!(
-            user_id_server_name("@alice:example.com"),
-            Some("example.com")
-        );
-        assert_eq!(
-            user_id_server_name("@alice:example.com:8448"),
-            Some("example.com:8448")
-        );
-        assert_eq!(user_id_server_name("alice:example.com"), None);
-        assert_eq!(user_id_server_name("@alice"), None);
-        assert_eq!(user_id_server_name(""), None);
-    }
-
-    /// Go HTML-escapes these and serde_json does not; a mismatch would put
-    /// peers in different LiveKit rooms.
-    #[test]
-    fn marshal_strings_matches_go_html_escaping() {
-        let encoded =
-            String::from_utf8(marshal_strings(&["!a&b:example.com", "m.call#ROOM"])).unwrap();
-
-        for raw in ['&', '<', '>'] {
-            assert!(!encoded.contains(raw), "{raw} not escaped in {encoded}");
-        }
-        assert!(encoded.contains("u0026"), "{encoded}");
-
-        // Computed by Go: json.Marshal, sha256, unpadded base64.
-        assert_eq!(
-            compute_room_alias("!a&b:example.com", "m.call#ROOM"),
-            "BlPHg/JCOxLQr20ttEizBQLd7Bhh5m+r3M8rO3ejvzo"
-        );
-    }
-
-    #[test]
-    fn marshal_strings_escapes_control_characters_like_go() {
-        let encoded = String::from_utf8(marshal_strings(&["a\u{8}b\u{c}c"])).unwrap();
-
-        // Go uses the \u00XX form where serde_json would emit \b and \f.
-        assert!(encoded.contains("u0008"), "{encoded}");
-        assert!(encoded.contains("u000c"), "{encoded}");
-        assert!(!encoded.contains('\u{8}'), "{encoded}");
-
-        let quoted = String::from_utf8(marshal_strings(&["a\"b"])).unwrap();
-        assert_eq!(quoted, r#"["a\"b"]"#);
-    }
-
-    #[test]
-    fn test_hashed_id_is_not_delimiter_joined() {
-        assert_ne!(
-            compute_room_alias("a", "b|c"),
-            compute_room_alias("a|b", "c")
-        );
-        assert_ne!(compute_room_alias("a", "bc"), compute_room_alias("ab", "c"));
-    }
-
-    #[test]
-    fn test_hashed_id_uses_standard_alphabet() {
-        let alias = compute_room_alias("!roomid:example.com", "slot1234");
-        assert!(alias.contains('+'));
-        assert!(!alias.contains('='));
     }
 
     #[tokio::test]
