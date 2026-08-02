@@ -23,9 +23,12 @@ async fn main() {
             }
             local
         })
+        // Required: a wildcard default would fail open.
         .unwrap_or_else(|_| {
-            eprintln!("LIVEKIT_FULL_ACCESS_HOMESERVERS not set, defaulting to wildcard (*) for full access");
-            "*".to_string()
+            eprintln!(
+                "LIVEKIT_FULL_ACCESS_HOMESERVERS must be set. Use \"*\" to allow any homeserver."
+            );
+            std::process::exit(1);
         });
 
     let full_access_homeservers = full_access_homeservers_str

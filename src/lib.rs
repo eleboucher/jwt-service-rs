@@ -1,4 +1,3 @@
-
 use axum::{
     Router,
     extract::{Extension, Json},
@@ -25,37 +24,101 @@ pub struct AppState {
     pub resolver: Arc<MatrixResolver>,
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, Default)]
+#[serde(deny_unknown_fields)]
 pub struct OpenIDTokenType {
     pub access_token: String,
+    #[serde(default)]
     pub token_type: String,
     pub matrix_server_name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_in: Option<i32>,
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, Default)]
+#[serde(deny_unknown_fields)]
 pub struct MatrixRTCMemberType {
     pub id: String,
+    #[serde(default)]
     pub claimed_user_id: String,
     pub claimed_device_id: String,
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+/// Deprecated: the body of `/sfu/get`.
+#[derive(Deserialize, Serialize, Debug, Default)]
+#[serde(deny_unknown_fields)]
 pub struct LegacySFURequest {
     pub room: String,
     pub openid_token: OpenIDTokenType,
     pub device_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay_id: Option<String>,
+    /// Milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay_timeout: Option<i64>,
+    /// Accepted and ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay_cs_api_url: Option<String>,
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, Default)]
+#[serde(deny_unknown_fields)]
 pub struct SFURequest {
     pub room_id: String,
     pub slot_id: String,
     pub openid_token: OpenIDTokenType,
     pub member: MatrixRTCMemberType,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub delayed_event_id: Option<String>,
+    /// Deprecated: later MSC revisions moved delegation to its own endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay_id: Option<String>,
+    /// Milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay_timeout: Option<i64>,
+    /// Accepted and ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay_cs_api_url: Option<String>,
+}
+
+/// Used once the client is already connected, so no JWT is issued and the
+/// delayed-event fields are mandatory.
+#[derive(Deserialize, Serialize, Debug, Default)]
+#[serde(deny_unknown_fields)]
+pub struct DelegateDelayedLeaveRequest {
+    pub room_id: String,
+    pub slot_id: String,
+    pub openid_token: OpenIDTokenType,
+    pub member: MatrixRTCMemberType,
+    pub delay_id: String,
+    /// Milliseconds.
+    pub delay_timeout: i64,
+    /// Accepted and ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay_cs_api_url: Option<String>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct DelegateDelayedLeaveResponse {}
+
+fn validate_delay_params(
+    delay_id: Option<&str>,
+    delay_timeout: Option<i64>,
+) -> Result<(), MatrixError> {
+    let has_id = delay_id.is_some_and(|id| !id.is_empty());
+    let has_timeout = delay_timeout.is_some_and(|t| t > 0);
+
+    if has_id != has_timeout {
+        error!(
+            delay_id = ?delay_id,
+            delay_timeout = ?delay_timeout,
+            "Missing delayed event delegation parameters"
+        );
+        return Err(MatrixError {
+            errcode: "M_BAD_JSON".to_string(),
+            error: "The request body is missing `delay_id` or `delay_timeout`".to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 #[derive(Serialize, Debug)]
@@ -90,7 +153,7 @@ impl ValidatableSFURequest for LegacySFURequest {
                 error: "Missing OpenID token parameters".to_string(),
             });
         }
-        Ok(())
+        validate_delay_params(self.delay_id.as_deref(), self.delay_timeout)
     }
 }
 
@@ -135,6 +198,45 @@ impl ValidatableSFURequest for SFURequest {
                 error: "The request body `openid_token` is missing a `access_token` or `matrix_server_name`".to_string(),
             });
         }
+        validate_delay_params(self.delay_id.as_deref(), self.delay_timeout)
+    }
+}
+
+impl ValidatableSFURequest for DelegateDelayedLeaveRequest {
+    fn validate(&self) -> Result<(), MatrixError> {
+        if self.room_id.is_empty() || self.slot_id.is_empty() {
+            return Err(MatrixError {
+                errcode: "M_BAD_JSON".to_string(),
+                error: "The request body is missing `room_id` or `slot_id`".to_string(),
+            });
+        }
+        if self.member.id.is_empty()
+            || self.member.claimed_user_id.is_empty()
+            || self.member.claimed_device_id.is_empty()
+        {
+            return Err(MatrixError {
+                errcode: "M_BAD_JSON".to_string(),
+                error: "The request body `member` is missing `id`, `claimed_user_id` or \
+                        `claimed_device_id`"
+                    .to_string(),
+            });
+        }
+        if self.openid_token.access_token.is_empty()
+            || self.openid_token.matrix_server_name.is_empty()
+        {
+            return Err(MatrixError {
+                errcode: "M_BAD_JSON".to_string(),
+                error: "The request body `openid_token` is missing `access_token` or \
+                        `matrix_server_name`"
+                    .to_string(),
+            });
+        }
+        if self.delay_id.is_empty() || self.delay_timeout <= 0 {
+            return Err(MatrixError {
+                errcode: "M_BAD_JSON".to_string(),
+                error: "The request body is missing `delay_id` or `delay_timeout`".to_string(),
+            });
+        }
         Ok(())
     }
 }
@@ -158,8 +260,7 @@ pub async fn handle_options() -> impl IntoResponse {
     (StatusCode::OK, headers)
 }
 
-/// Legacy endpoint handler - supports both LegacySFURequest and SFURequest
-/// TODO: This is deprecated and will be removed in future versions
+/// Deprecated: serves the pre-Matrix-2.0 `/sfu/get` endpoint.
 #[instrument(skip(state, body))]
 pub async fn handle_legacy_post(
     Extension(state): Extension<Arc<AppState>>,
@@ -167,35 +268,41 @@ pub async fn handle_legacy_post(
 ) -> Response {
     info!("Processing legacy /sfu/get request");
 
+    let headers = json_cors_headers();
+
+    let payload = match serde_json::from_str::<LegacySFURequest>(&body) {
+        Ok(payload) => payload,
+        Err(e) => {
+            error!(error = %e, "Error reading request");
+            let err = MatrixError {
+                errcode: "M_NOT_JSON".to_string(),
+                error: "Error reading request".to_string(),
+            };
+            return (StatusCode::BAD_REQUEST, headers, axum::Json(err)).into_response();
+        }
+    };
+
+    if let Err(e) = payload.validate() {
+        error!(errcode = %e.errcode, error = %e.error, "Validation failed");
+        return (StatusCode::BAD_REQUEST, headers, axum::Json(e)).into_response();
+    }
+
+    handle_legacy_sfu_request(state, payload, headers).await
+}
+
+fn json_cors_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert("Access-Control-Allow-Origin", "*".parse().unwrap());
     headers.insert("Content-Type", "application/json".parse().unwrap());
+    headers
+}
 
-    // Try to parse as SFURequest first, then LegacySFURequest
-    if let Ok(payload) = serde_json::from_str::<SFURequest>(&body) {
-        if let Err(e) = payload.validate() {
-            error!(errcode = %e.errcode, error = %e.error, "Validation failed");
-            return (StatusCode::BAD_REQUEST, headers, axum::Json(e)).into_response();
-        }
-        return handle_sfu_request(state, payload, headers).await;
+/// One error for every authentication failure, so the cause is not disclosed.
+fn unauthorised() -> MatrixError {
+    MatrixError {
+        errcode: "M_UNAUTHORIZED".to_string(),
+        error: "The request could not be authorised.".to_string(),
     }
-
-    if let Ok(payload) = serde_json::from_str::<LegacySFURequest>(&body) {
-        if let Err(e) = payload.validate() {
-            error!(errcode = %e.errcode, error = %e.error, "Validation failed");
-            return (StatusCode::BAD_REQUEST, headers, axum::Json(e)).into_response();
-        }
-        return handle_legacy_sfu_request(state, payload, headers).await;
-    }
-
-    error!("Failed to parse request body as either SFURequest or LegacySFURequest");
-    let err = MatrixError {
-        errcode: "M_BAD_JSON".to_string(),
-        error:
-            "The request body was malformed, missing required fields, or contained invalid values"
-                .to_string(),
-    };
-    (StatusCode::BAD_REQUEST, headers, axum::Json(err)).into_response()
 }
 
 /// New MSC4195 endpoint handler - only accepts SFURequest
@@ -233,16 +340,17 @@ async fn handle_legacy_sfu_request(
         Ok(user) => user,
         Err(e) => {
             error!(
-                errcode = "M_LOOKUP_FAILED",
+                errcode = "M_UNAUTHORIZED",
                 error = %e,
                 server_name = %payload.openid_token.matrix_server_name,
-                "Failed to look up user info from homeserver"
+                "The request could not be authorised"
             );
-            let err = MatrixError {
-                errcode: "M_LOOKUP_FAILED".to_string(),
-                error: format!("Failed to look up user info from homeserver: {e}"),
-            };
-            return (StatusCode::INTERNAL_SERVER_ERROR, headers, axum::Json(err)).into_response();
+            return (
+                StatusCode::UNAUTHORIZED,
+                headers,
+                axum::Json(unauthorised()),
+            )
+                .into_response();
         }
     };
 
@@ -264,13 +372,7 @@ async fn handle_legacy_sfu_request(
     let slot_id = "m.call#ROOM";
     let lk_room_alias = compute_room_alias(&payload.room, slot_id);
 
-    let token = match get_join_token(
-        is_full_access_user,
-        &state.key,
-        &state.secret,
-        &lk_room_alias,
-        &lk_identity,
-    ) {
+    let token = match get_join_token(&state.key, &state.secret, &lk_room_alias, &lk_identity) {
         Ok(t) => t,
         Err(e) => {
             error!(errcode = "M_UNKNOWN", error = %e, "Failed to generate join token");
@@ -289,7 +391,9 @@ async fn handle_legacy_sfu_request(
             &state.secret,
         );
         let options = livekit_api::services::room::CreateRoomOptions {
-            empty_timeout: 5 * 60, // 5 Minutes to keep the room open if no one joins
+            empty_timeout: 5 * 60, // keep the room open if no one joins
+            departure_timeout: 20, // keep the room after everyone leaves
+            max_participants: 0,   // no limit
             ..Default::default()
         };
         match lk_client.create_room(&lk_room_alias, options).await {
@@ -389,13 +493,7 @@ async fn handle_sfu_request(
     // Use base64 encoded hash of room_id|slot_id for room alias
     let lk_room_alias = compute_room_alias(&payload.room_id, &payload.slot_id);
 
-    let token = match get_join_token(
-        is_full_access_user,
-        &state.key,
-        &state.secret,
-        &lk_room_alias,
-        &lk_identity,
-    ) {
+    let token = match get_join_token(&state.key, &state.secret, &lk_room_alias, &lk_identity) {
         Ok(t) => t,
         Err(e) => {
             error!(errcode = "M_UNKNOWN", error = %e, "Failed to generate join token");
@@ -414,7 +512,9 @@ async fn handle_sfu_request(
             &state.secret,
         );
         let options = livekit_api::services::room::CreateRoomOptions {
-            empty_timeout: 5 * 60, // 5 Minutes to keep the room open if no one joins
+            empty_timeout: 5 * 60, // keep the room open if no one joins
+            departure_timeout: 20, // keep the room after everyone leaves
+            max_participants: 0,   // no limit
             ..Default::default()
         };
         match lk_client.create_room(&lk_room_alias, options).await {
@@ -471,6 +571,9 @@ pub enum ExchangeOpenIdUserInfoError {
 
     #[error("HTTP client error: {0}")]
     Http(#[from] reqwest::Error),
+
+    #[error("Userinfo lookup returned HTTP {0}")]
+    UnexpectedStatus(StatusCode),
 }
 
 #[instrument(level="debug", skip(token, resolver, federation_client), fields(server = %token.matrix_server_name))]
@@ -508,6 +611,12 @@ pub async fn exchange_openid_userinfo(
 
     trace!("Sent request");
 
+    let status = response.status();
+    if !status.is_success() {
+        error!(%status, "Userinfo lookup returned a non-success status");
+        return Err(ExchangeOpenIdUserInfoError::UnexpectedStatus(status));
+    }
+
     let user_info = response.json().await?;
     trace!("Parsed response");
 
@@ -527,27 +636,34 @@ fn is_full_access_user(
     full_access_homeservers.contains(matrix_server_name)
 }
 
+/// `unpadded_base64(sha256(json_serialize(parts)))`, per MSC4195.
+///
+/// The hash input is a compact JSON array matching Go's
+/// `json.Marshal([]string{...})`, and the standard base64 alphabet, not the
+/// URL-safe one. Both details have to match or peers land in different rooms.
+fn hashed_id(parts: &[&str]) -> String {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    let json = serde_json::to_vec(parts).expect("serializing a string array cannot fail");
+
+    STANDARD
+        .encode(Sha256::digest(&json))
+        .trim_end_matches('=')
+        .to_string()
+}
+
 fn compute_room_alias(room_id: &str, slot_id: &str) -> String {
-    let input = format!("{}|{}", room_id, slot_id);
-    let hash = Sha256::digest(input.as_bytes());
-    base64_url_encode(&hash)
+    hashed_id(&[room_id, slot_id])
 }
 
 fn compute_participant_identity(user_id: &str, device_id: &str, member_id: &str) -> String {
-    let input = format!("{}|{}|{}", user_id, device_id, member_id);
-    let hash = Sha256::digest(input.as_bytes());
-    base64_url_encode(&hash)
+    hashed_id(&[user_id, device_id, member_id])
 }
 
-fn base64_url_encode(data: &[u8]) -> String {
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
-    // Use standard base64 without padding (like Go's base64.StdEncoding.WithPadding(base64.NoPadding))
-    STANDARD.encode(data).trim_end_matches('=').to_string()
-}
-
+/// `room_create` is never granted: rooms are created server-side via the
+/// RoomService API, which is what Element Call expects with `auto_create: false`.
 #[instrument(skip(api_key, api_secret, room, identity))]
 pub fn get_join_token(
-    is_full_access_user: bool,
     api_key: &str,
     api_secret: &str,
     room: &str,
@@ -556,15 +672,11 @@ pub fn get_join_token(
     livekit_api::access_token::AccessToken::with_api_key(api_key, api_secret)
         .with_grants(VideoGrants {
             room: room.to_string(),
-            // Only full-access users can create the room
-            room_create: is_full_access_user,
-            // But all users can join the room
+            room_create: false,
             room_join: true,
-
-            // These defaults are true anyway
             can_publish: true,
             can_subscribe: true,
-            can_publish_data: true,
+            can_update_own_metadata: true,
 
             ..Default::default()
         })
@@ -724,32 +836,40 @@ mod tests {
         let api_secret = "testSecret";
         let room = "testRoom";
         let identity = "testIdentity@example.com";
-        for &is_full_access_user in &[true, false] {
-            let token =
-                get_join_token(is_full_access_user, api_key, api_secret, room, identity).unwrap();
-            assert!(!token.is_empty());
-        }
+        let token = get_join_token(api_key, api_secret, room, identity).unwrap();
+        assert!(!token.is_empty());
     }
 
-    #[tokio::test]
-    async fn test_compute_room_alias() {
-        let room_id = "!test:example.com";
-        let slot_id = "m.call#ROOM";
-        let alias = compute_room_alias(room_id, slot_id);
-        // Verify it's base64 encoded (no padding)
+    #[test]
+    fn test_compute_room_alias_msc4195_vector() {
+        assert_eq!(
+            compute_room_alias("!roomid:example.com", "slot1234"),
+            "O8437W3+jmzMVjoIP3tNwbm+XxHQk2iKpOA7aqw3qSc"
+        );
+    }
+
+    #[test]
+    fn test_compute_participant_identity_msc4195_vector() {
+        assert_eq!(
+            compute_participant_identity("@alice:example.com", "DEVICE123", "memberABC"),
+            "J+T45tGruxc+HrUOqJJlyQSV33m728Cme4+vt8/SWrU"
+        );
+    }
+
+    #[test]
+    fn test_hashed_id_is_not_delimiter_joined() {
+        assert_ne!(
+            compute_room_alias("a", "b|c"),
+            compute_room_alias("a|b", "c")
+        );
+        assert_ne!(compute_room_alias("a", "bc"), compute_room_alias("ab", "c"));
+    }
+
+    #[test]
+    fn test_hashed_id_uses_standard_alphabet() {
+        let alias = compute_room_alias("!roomid:example.com", "slot1234");
+        assert!(alias.contains('+'));
         assert!(!alias.contains('='));
-        assert!(!alias.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_compute_participant_identity() {
-        let user_id = "@user:example.com";
-        let device_id = "DEVICE123";
-        let member_id = "member456";
-        let identity = compute_participant_identity(user_id, device_id, member_id);
-        // Verify it's base64 encoded (no padding)
-        assert!(!identity.contains('='));
-        assert!(!identity.is_empty());
     }
 
     #[tokio::test]
@@ -781,8 +901,6 @@ mod tests {
     /// - No need for client caching or LRU eviction
     #[tokio::test]
     async fn test_client_reuse_with_dynamic_dns() {
-        use crate::resolve::MatrixResolver;
-
         // Initialize resolver (wrapped in Arc for sharing)
         let resolver = Arc::new(MatrixResolver::new().await.unwrap());
 
