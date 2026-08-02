@@ -1,4 +1,9 @@
-use jwt_service::{AppState, MatrixResolver, build_app, read_key_secret};
+use jwt_service::{
+    AppState, MatrixResolver, build_app,
+    cs_api::CsApiUrlCache,
+    delayed_event::{DelayedEventManager, JobContext, LiveKitAuth},
+    read_key_secret,
+};
 use std::{
     collections::HashSet,
     env,
@@ -72,11 +77,33 @@ async fn main() {
         .with(filter)
         .with(tracing_subscriber::fmt::layer())
         .init();
-    let resolver = Arc::new(MatrixResolver::new().await.unwrap());
+    let resolver = Arc::new(MatrixResolver::new().unwrap());
     let builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .tls_danger_accept_invalid_certs(skip_verify_tls);
     let federation_client = resolver.create_client_with_builder(builder).unwrap();
+
+    // server=url,server2=url2
+    let cs_api_overrides: std::collections::HashMap<String, String> =
+        env::var("LIVEKIT_CS_API_URL_OVERRIDES")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|entry| entry.trim().split_once('='))
+            .map(|(server, url)| (server.trim().to_owned(), url.trim().to_owned()))
+            .collect();
+
+    // 0 disables the check.
+    let sanity_check_interval = match env::var("LIVEKIT_SANITY_CHECK_INTERVAL_SECONDS") {
+        Ok(value) => match value.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(seconds) => Some(std::time::Duration::from_secs(seconds)),
+            Err(e) => {
+                eprintln!("Invalid LIVEKIT_SANITY_CHECK_INTERVAL_SECONDS: {e}");
+                std::process::exit(1);
+            }
+        },
+        Err(_) => None,
+    };
 
     println!("LIVEKIT_URL: {}", lk_url);
     println!("LIVEKIT_JWT_BIND: {}", lk_jwt_bind);
@@ -85,6 +112,18 @@ async fn main() {
         full_access_homeservers
     );
 
+    let delayed_events = Arc::new(DelayedEventManager::new(JobContext {
+        http: reqwest::Client::new(),
+        cs_api_overrides,
+        cs_api_cache: Arc::new(CsApiUrlCache::new()),
+        live_kit: LiveKitAuth {
+            url: lk_url.clone(),
+            key: key.clone(),
+            secret: secret.clone(),
+        },
+        sanity_check_interval,
+    }));
+
     let state = Arc::new(AppState {
         key,
         secret,
@@ -92,6 +131,7 @@ async fn main() {
         full_access_homeservers,
         federation_client,
         resolver,
+        delayed_events,
     });
 
     let app = build_app(state);

@@ -1,3 +1,6 @@
+pub mod cs_api;
+pub mod delayed_event;
+
 use axum::{
     Router,
     extract::{Extension, Json},
@@ -9,10 +12,15 @@ use livekit_api::access_token::VideoGrants;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{collections::HashSet, env, sync::Arc, time::Duration};
-use tracing::{error, info, instrument, trace, warn};
+use tracing::{debug, error, info, instrument, trace, warn};
 use url::Url;
 
 pub use resolvematrix::server::MatrixResolver;
+
+use crate::delayed_event::{DelayedEventManager, JobParams, Signal};
+
+/// Ceiling on the client-supplied `delay_timeout`.
+const MAX_DELAY_TIMEOUT: Duration = Duration::from_hours(24);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -22,6 +30,35 @@ pub struct AppState {
     pub full_access_homeservers: HashSet<String>,
     pub federation_client: reqwest::Client,
     pub resolver: Arc<MatrixResolver>,
+    pub delayed_events: Arc<DelayedEventManager>,
+}
+
+impl AppState {
+    /// Schedules the delayed leave event, if the client asked us to take it
+    /// over. Restricted to full-access homeservers, as in lk-jwt-service.
+    async fn delegate_delayed_leave(
+        &self,
+        server_name: &str,
+        delay_id: &str,
+        delay_timeout_ms: i64,
+        live_kit_room: &str,
+        live_kit_identity: &str,
+    ) {
+        // The client's claim is unverifiable, so cap it. An absurd value would
+        // otherwise keep a job alive indefinitely.
+        let delay_timeout =
+            Duration::from_millis(delay_timeout_ms.unsigned_abs()).min(MAX_DELAY_TIMEOUT);
+
+        self.delayed_events
+            .add_job(JobParams {
+                delay_id: delay_id.to_owned(),
+                delay_timeout,
+                server_name: server_name.to_owned(),
+                live_kit_room: live_kit_room.to_owned(),
+                live_kit_identity: live_kit_identity.to_owned(),
+            })
+            .await;
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug, Default)]
@@ -415,12 +452,35 @@ async fn handle_legacy_sfu_request(
                 );
                 let err = MatrixError {
                     errcode: "M_UNKNOWN".to_string(),
-                    error: format!("Unable to create room on SFU: {e}"),
+                    error: "Unable to create room on SFU".to_string(),
                 };
                 return (StatusCode::INTERNAL_SERVER_ERROR, headers, axum::Json(err))
                     .into_response();
             }
         }
+    }
+
+    if let (Some(delay_id), Some(delay_timeout)) = (&payload.delay_id, payload.delay_timeout) {
+        // Refuse rather than silently drop it: the client would otherwise
+        // believe its deadman switch was delegated and stop restarting it.
+        if !is_full_access_user {
+            let err = MatrixError {
+                errcode: "M_BAD_JSON".to_string(),
+                error: "Delegation of delayed events is only supported for full access users"
+                    .to_string(),
+            };
+            return (StatusCode::BAD_REQUEST, headers, axum::Json(err)).into_response();
+        }
+
+        state
+            .delegate_delayed_leave(
+                &payload.openid_token.matrix_server_name,
+                delay_id,
+                delay_timeout,
+                &lk_room_alias,
+                &lk_identity,
+            )
+            .await;
     }
 
     let res = SFUResponse {
@@ -536,12 +596,35 @@ async fn handle_sfu_request(
                 );
                 let err = MatrixError {
                     errcode: "M_UNKNOWN".to_string(),
-                    error: format!("Unable to create room on SFU: {e}"),
+                    error: "Unable to create room on SFU".to_string(),
                 };
                 return (StatusCode::INTERNAL_SERVER_ERROR, headers, axum::Json(err))
                     .into_response();
             }
         }
+    }
+
+    if let (Some(delay_id), Some(delay_timeout)) = (&payload.delay_id, payload.delay_timeout) {
+        // Refuse rather than silently drop it: the client would otherwise
+        // believe its deadman switch was delegated and stop restarting it.
+        if !is_full_access_user {
+            let err = MatrixError {
+                errcode: "M_BAD_JSON".to_string(),
+                error: "Delegation of delayed events is only supported for full access users"
+                    .to_string(),
+            };
+            return (StatusCode::BAD_REQUEST, headers, axum::Json(err)).into_response();
+        }
+
+        state
+            .delegate_delayed_leave(
+                &payload.openid_token.matrix_server_name,
+                delay_id,
+                delay_timeout,
+                &lk_room_alias,
+                &lk_identity,
+            )
+            .await;
     }
 
     let res = SFUResponse {
@@ -565,7 +648,7 @@ pub enum ExchangeOpenIdUserInfoError {
     #[error("Invalid token")]
     InvalidToken,
     #[error("Failed to resolve matrix server: {0}")]
-    FailedToResolveMatrixServer(#[from] resolvematrix::server::ResolveServerError),
+    FailedToResolveMatrixServer(#[from] resolvematrix::error::ServerResolutionError),
     #[error("Bad URL: {0}")]
     BadUrl(#[from] url::ParseError),
 
@@ -574,6 +657,9 @@ pub enum ExchangeOpenIdUserInfoError {
 
     #[error("Userinfo lookup returned HTTP {0}")]
     UnexpectedStatus(StatusCode),
+
+    #[error("Userinfo returned a user ID belonging to another server")]
+    ForeignUserId,
 }
 
 #[instrument(level="debug", skip(token, resolver, federation_client), fields(server = %token.matrix_server_name))]
@@ -617,10 +703,30 @@ pub async fn exchange_openid_userinfo(
         return Err(ExchangeOpenIdUserInfoError::UnexpectedStatus(status));
     }
 
-    let user_info = response.json().await?;
+    let user_info: UserInfo = response.json().await?;
     trace!("Parsed response");
 
+    // The spec requires this: "The caller MUST validate that the returned user
+    // ID is on the server they called". Without it, any host can vouch for a
+    // user on any homeserver simply by answering with their MXID.
+    if user_id_server_name(&user_info.sub) != Some(token.matrix_server_name.as_str()) {
+        error!(
+            sub = %user_info.sub,
+            server = %token.matrix_server_name,
+            "Userinfo returned a user ID belonging to another server"
+        );
+        return Err(ExchangeOpenIdUserInfoError::ForeignUserId);
+    }
+
     Ok(user_info)
+}
+
+/// The server name of an MXID, i.e. everything after the first colon.
+fn user_id_server_name(user_id: &str) -> Option<&str> {
+    user_id
+        .strip_prefix('@')?
+        .split_once(':')
+        .map(|(_, server)| server)
 }
 
 fn is_full_access_user(
@@ -644,12 +750,70 @@ fn is_full_access_user(
 fn hashed_id(parts: &[&str]) -> String {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
 
-    let json = serde_json::to_vec(parts).expect("serializing a string array cannot fail");
-
     STANDARD
-        .encode(Sha256::digest(&json))
+        .encode(Sha256::digest(marshal_strings(parts)))
         .trim_end_matches('=')
         .to_string()
+}
+/// Serialises like Go's `json.Marshal([]string{...})`.
+///
+/// Go's encoder HTML-escapes `<`, `>` and `&`, and spells backspace and form
+/// feed in the `\u00XX` form. serde_json does neither, so without this an id
+/// containing one of those would hash differently here than in
+/// lk-jwt-service and put peers in different LiveKit rooms.
+fn marshal_strings(parts: &[&str]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut serializer = serde_json::Serializer::with_formatter(&mut out, GoFormatter);
+
+    parts
+        .serialize(&mut serializer)
+        .expect("serializing a string array to a Vec cannot fail");
+
+    out
+}
+
+struct GoFormatter;
+
+impl serde_json::ser::Formatter for GoFormatter {
+    fn write_string_fragment<W>(&mut self, writer: &mut W, fragment: &str) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        let mut rest = fragment;
+
+        while let Some(at) = rest.find(['<', '>', '&']) {
+            let (before, tail) = rest.split_at(at);
+            let escaped = tail.chars().next().expect("find returns a char boundary");
+
+            writer.write_all(before.as_bytes())?;
+            write!(writer, "\\u{:04x}", escaped as u32)?;
+
+            rest = &tail[escaped.len_utf8()..];
+        }
+
+        writer.write_all(rest.as_bytes())
+    }
+
+    fn write_char_escape<W>(
+        &mut self,
+        writer: &mut W,
+        char_escape: serde_json::ser::CharEscape,
+    ) -> std::io::Result<()>
+    where
+        W: ?Sized + std::io::Write,
+    {
+        use serde_json::ser::CharEscape::{Backspace, FormFeed};
+
+        match char_escape {
+            Backspace => write!(writer, "\\u0008"),
+            FormFeed => write!(writer, "\\u000c"),
+            other => serde_json::ser::Formatter::write_char_escape(
+                &mut serde_json::ser::CompactFormatter,
+                writer,
+                other,
+            ),
+        }
+    }
 }
 
 fn compute_room_alias(room_id: &str, slot_id: &str) -> String {
@@ -721,6 +885,143 @@ pub fn read_key_secret() -> (String, String) {
     (key.trim().to_string(), secret.trim().to_string())
 }
 
+/// # `POST /delegate_delayed_leave`
+///
+/// Hands the delayed leave event over after the client is already connected,
+/// so no JWT is issued and the LiveKit room already exists.
+#[instrument(skip(state, payload))]
+pub async fn handle_delegate_delayed_leave(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(payload): Json<DelegateDelayedLeaveRequest>,
+) -> Response {
+    let headers = json_cors_headers();
+
+    if let Err(e) = payload.validate() {
+        error!(errcode = %e.errcode, error = %e.error, "Validation failed");
+        return (StatusCode::BAD_REQUEST, headers, axum::Json(e)).into_response();
+    }
+
+    let user_info = match exchange_openid_userinfo(
+        &payload.openid_token,
+        &state.resolver,
+        &state.federation_client,
+    )
+    .await
+    {
+        Ok(user) => user,
+        Err(e) => {
+            error!(error = %e, "The request could not be authorised");
+            return (
+                StatusCode::UNAUTHORIZED,
+                headers,
+                axum::Json(unauthorised()),
+            )
+                .into_response();
+        }
+    };
+
+    if payload.member.claimed_user_id != user_info.sub {
+        error!("Claimed user ID does not match token subject");
+        return (
+            StatusCode::UNAUTHORIZED,
+            headers,
+            axum::Json(unauthorised()),
+        )
+            .into_response();
+    }
+
+    if !is_full_access_user(
+        &state.full_access_homeservers,
+        &payload.openid_token.matrix_server_name,
+    ) {
+        let err = MatrixError {
+            errcode: "M_FORBIDDEN".to_string(),
+            error: "Delegation of delayed events is only supported for full access users"
+                .to_string(),
+        };
+        return (StatusCode::FORBIDDEN, headers, axum::Json(err)).into_response();
+    }
+
+    let lk_identity = compute_participant_identity(
+        &user_info.sub,
+        &payload.member.claimed_device_id,
+        &payload.member.id,
+    );
+    let lk_room_alias = compute_room_alias(&payload.room_id, &payload.slot_id);
+
+    state
+        .delegate_delayed_leave(
+            &payload.openid_token.matrix_server_name,
+            &payload.delay_id,
+            payload.delay_timeout,
+            &lk_room_alias,
+            &lk_identity,
+        )
+        .await;
+
+    (
+        StatusCode::OK,
+        headers,
+        axum::Json(DelegateDelayedLeaveResponse {}),
+    )
+        .into_response()
+}
+
+/// # `POST /sfu_webhook`
+///
+/// Receives LiveKit participant events. Signed with the API key/secret, so no
+/// CORS and no Matrix auth.
+#[instrument(skip(state, headers, body))]
+pub async fn handle_sfu_webhook(
+    Extension(state): Extension<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> StatusCode {
+    let auth = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+
+    let receiver = livekit_api::webhooks::WebhookReceiver::new(
+        livekit_api::access_token::TokenVerifier::with_api_key(&state.key, &state.secret),
+    );
+
+    let event = match receiver.receive(&body, auth) {
+        Ok(event) => event,
+        Err(e) => {
+            warn!(error = %e, "SFU webhook error");
+            return StatusCode::OK;
+        }
+    };
+
+    let (Some(room), Some(participant)) = (&event.room, &event.participant) else {
+        return StatusCode::OK;
+    };
+
+    // Only a client-initiated leave is intentional; anything else is a drop.
+    let signal = match event.event.as_str() {
+        "participant_joined" => Signal::ParticipantConnected,
+        "participant_left" | "participant_connection_aborted" => {
+            if participant.disconnect_reason
+                == livekit_protocol::DisconnectReason::ClientInitiated as i32
+            {
+                Signal::ParticipantDisconnectedIntentionally
+            } else {
+                Signal::ParticipantConnectionAborted
+            }
+        }
+        _ => return StatusCode::OK,
+    };
+
+    debug!(room = %room.name, identity = %participant.identity, ?signal, "SFU webhook");
+    state
+        .delayed_events
+        .dispatch(&room.name, &participant.identity, signal)
+        .await;
+
+    StatusCode::OK
+}
+
 pub fn build_app(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/healthz", get(healthcheck))
@@ -733,6 +1034,11 @@ pub fn build_app(state: Arc<AppState>) -> Router {
                 },
             ),
         )
+        .route(
+            "/delegate_delayed_leave",
+            options(handle_options).post(handle_delegate_delayed_leave),
+        )
+        .route("/sfu_webhook", axum::routing::post(handle_sfu_webhook))
         .layer(Extension(state))
 }
 
@@ -745,9 +1051,23 @@ mod tests {
     use std::sync::Arc;
     use tower::ServiceExt; // for `oneshot` method
 
+    fn test_manager() -> Arc<DelayedEventManager> {
+        Arc::new(DelayedEventManager::new(delayed_event::JobContext {
+            http: reqwest::Client::new(),
+            cs_api_overrides: std::collections::HashMap::new(),
+            cs_api_cache: Arc::new(cs_api::CsApiUrlCache::new()),
+            live_kit: delayed_event::LiveKitAuth {
+                url: String::new(),
+                key: String::new(),
+                secret: String::new(),
+            },
+            sanity_check_interval: None,
+        }))
+    }
+
     #[tokio::test]
     async fn test_healthcheck() {
-        let resolver = Arc::new(MatrixResolver::new().await.unwrap());
+        let resolver = Arc::new(MatrixResolver::new().unwrap());
         let federation_client = resolver.create_client().unwrap();
 
         let state = Arc::new(AppState {
@@ -757,6 +1077,7 @@ mod tests {
             full_access_homeservers: HashSet::new(),
             federation_client,
             resolver,
+            delayed_events: test_manager(),
         });
         let app = build_app(state);
         let response = app
@@ -773,7 +1094,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_options() {
-        let resolver = Arc::new(MatrixResolver::new().await.unwrap());
+        let resolver = Arc::new(MatrixResolver::new().unwrap());
         let federation_client = resolver.create_client().unwrap();
 
         let state = Arc::new(AppState {
@@ -783,6 +1104,7 @@ mod tests {
             full_access_homeservers: HashSet::new(),
             federation_client,
             resolver,
+            delayed_events: test_manager(),
         });
         let app = build_app(state);
         let response = app
@@ -803,7 +1125,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_post_missing_params() {
-        let resolver = Arc::new(MatrixResolver::new().await.unwrap());
+        let resolver = Arc::new(MatrixResolver::new().unwrap());
         let federation_client = resolver.create_client().unwrap();
 
         let state = Arc::new(AppState {
@@ -813,6 +1135,7 @@ mod tests {
             full_access_homeservers: HashSet::new(),
             federation_client,
             resolver,
+            delayed_events: test_manager(),
         });
         let app = build_app(state);
         let body = serde_json::json!({}).to_string();
@@ -854,6 +1177,55 @@ mod tests {
             compute_participant_identity("@alice:example.com", "DEVICE123", "memberABC"),
             "J+T45tGruxc+HrUOqJJlyQSV33m728Cme4+vt8/SWrU"
         );
+    }
+
+    /// The spec requires the caller to reject a `sub` that is not on the
+    /// server it queried; without it any host can vouch for anyone.
+    #[test]
+    fn user_id_server_name_extracts_the_domain() {
+        assert_eq!(
+            user_id_server_name("@alice:example.com"),
+            Some("example.com")
+        );
+        assert_eq!(
+            user_id_server_name("@alice:example.com:8448"),
+            Some("example.com:8448")
+        );
+        assert_eq!(user_id_server_name("alice:example.com"), None);
+        assert_eq!(user_id_server_name("@alice"), None);
+        assert_eq!(user_id_server_name(""), None);
+    }
+
+    /// Go HTML-escapes these and serde_json does not; a mismatch would put
+    /// peers in different LiveKit rooms.
+    #[test]
+    fn marshal_strings_matches_go_html_escaping() {
+        let encoded =
+            String::from_utf8(marshal_strings(&["!a&b:example.com", "m.call#ROOM"])).unwrap();
+
+        for raw in ['&', '<', '>'] {
+            assert!(!encoded.contains(raw), "{raw} not escaped in {encoded}");
+        }
+        assert!(encoded.contains("u0026"), "{encoded}");
+
+        // Computed by Go: json.Marshal, sha256, unpadded base64.
+        assert_eq!(
+            compute_room_alias("!a&b:example.com", "m.call#ROOM"),
+            "BlPHg/JCOxLQr20ttEizBQLd7Bhh5m+r3M8rO3ejvzo"
+        );
+    }
+
+    #[test]
+    fn marshal_strings_escapes_control_characters_like_go() {
+        let encoded = String::from_utf8(marshal_strings(&["a\u{8}b\u{c}c"])).unwrap();
+
+        // Go uses the \u00XX form where serde_json would emit \b and \f.
+        assert!(encoded.contains("u0008"), "{encoded}");
+        assert!(encoded.contains("u000c"), "{encoded}");
+        assert!(!encoded.contains('\u{8}'), "{encoded}");
+
+        let quoted = String::from_utf8(marshal_strings(&["a\"b"])).unwrap();
+        assert_eq!(quoted, r#"["a\"b"]"#);
     }
 
     #[test]
@@ -902,7 +1274,7 @@ mod tests {
     #[tokio::test]
     async fn test_client_reuse_with_dynamic_dns() {
         // Initialize resolver (wrapped in Arc for sharing)
-        let resolver = Arc::new(MatrixResolver::new().await.unwrap());
+        let resolver = Arc::new(MatrixResolver::new().unwrap());
 
         // Create ONE client with the Matrix DNS resolver
         // This client can be reused for ALL Matrix federation requests
@@ -916,6 +1288,7 @@ mod tests {
             full_access_homeservers: HashSet::new(),
             federation_client, // Reusable for ALL servers with correct SNI
             resolver,
+            delayed_events: test_manager(),
         };
 
         // The federation_client will now correctly handle requests to any Matrix server:
