@@ -4,6 +4,8 @@
 //! Kept free of HTTP, OpenID and Matrix server resolution so a homeserver can
 //! reuse it without inheriting a standalone service's dependencies.
 
+pub mod wire;
+
 use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};

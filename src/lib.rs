@@ -61,94 +61,18 @@ impl AppState {
     }
 }
 
-#[derive(Deserialize, Serialize, Debug, Default)]
-#[serde(deny_unknown_fields)]
-pub struct OpenIDTokenType {
-    pub access_token: String,
-    #[serde(default)]
-    pub token_type: String,
-    pub matrix_server_name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_in: Option<i32>,
-}
-
-#[derive(Deserialize, Serialize, Debug, Default)]
-#[serde(deny_unknown_fields)]
-pub struct MatrixRTCMemberType {
-    pub id: String,
-    #[serde(default)]
-    pub claimed_user_id: String,
-    pub claimed_device_id: String,
-}
-
-/// Deprecated: the body of `/sfu/get`.
-#[derive(Deserialize, Serialize, Debug, Default)]
-#[serde(deny_unknown_fields)]
-pub struct LegacySFURequest {
-    pub room: String,
-    pub openid_token: OpenIDTokenType,
-    pub device_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub delay_id: Option<String>,
-    /// Milliseconds.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub delay_timeout: Option<i64>,
-    /// Accepted and ignored.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub delay_cs_api_url: Option<String>,
-}
-
-#[derive(Deserialize, Serialize, Debug, Default)]
-#[serde(deny_unknown_fields)]
-pub struct SFURequest {
-    pub room_id: String,
-    pub slot_id: String,
-    pub openid_token: OpenIDTokenType,
-    pub member: MatrixRTCMemberType,
-    /// Deprecated: later MSC revisions moved delegation to its own endpoint.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub delay_id: Option<String>,
-    /// Milliseconds.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub delay_timeout: Option<i64>,
-    /// Accepted and ignored.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub delay_cs_api_url: Option<String>,
-}
-
-/// Used once the client is already connected, so no JWT is issued and the
-/// delayed-event fields are mandatory.
-#[derive(Deserialize, Serialize, Debug, Default)]
-#[serde(deny_unknown_fields)]
-pub struct DelegateDelayedLeaveRequest {
-    pub room_id: String,
-    pub slot_id: String,
-    pub openid_token: OpenIDTokenType,
-    pub member: MatrixRTCMemberType,
-    pub delay_id: String,
-    /// Milliseconds.
-    pub delay_timeout: i64,
-    /// Accepted and ignored.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub delay_cs_api_url: Option<String>,
-}
+pub use jwt_service_core::wire::{
+    DelegateDelayedLeaveRequest, GetTokenRequest as SFURequest,
+    LegacySfuRequest as LegacySFURequest, MatrixError, OpenIdToken as OpenIDTokenType,
+    RtcMember as MatrixRTCMemberType, SfuResponse as SFUResponse,
+};
 
 #[derive(Serialize, Debug)]
 pub struct DelegateDelayedLeaveResponse {}
 
-fn validate_delay_params(
-    delay_id: Option<&str>,
-    delay_timeout: Option<i64>,
-) -> Result<(), MatrixError> {
-    let has_id = delay_id.is_some_and(|id| !id.is_empty());
-    let has_timeout = delay_timeout.is_some_and(|t| t > 0);
-
-    if has_id != has_timeout {
-        error!(
-            delay_id = ?delay_id,
-            delay_timeout = ?delay_timeout,
-            "Missing delayed event delegation parameters"
-        );
+fn check_delay_params(delay: &jwt_service_core::wire::DelayParams) -> Result<(), MatrixError> {
+    if delay.is_half_specified() {
+        error!("Missing delayed event delegation parameters");
         return Err(MatrixError {
             errcode: "M_BAD_JSON".to_string(),
             error: "The request body is missing `delay_id` or `delay_timeout`".to_string(),
@@ -156,18 +80,6 @@ fn validate_delay_params(
     }
 
     Ok(())
-}
-
-#[derive(Serialize, Debug)]
-pub struct SFUResponse {
-    pub url: String,
-    pub jwt: String,
-}
-
-#[derive(Serialize, Debug)]
-pub struct MatrixError {
-    pub errcode: String,
-    pub error: String,
 }
 
 trait ValidatableSFURequest {
@@ -190,7 +102,7 @@ impl ValidatableSFURequest for LegacySFURequest {
                 error: "Missing OpenID token parameters".to_string(),
             });
         }
-        validate_delay_params(self.delay_id.as_deref(), self.delay_timeout)
+        check_delay_params(&self.delay)
     }
 }
 
@@ -235,7 +147,7 @@ impl ValidatableSFURequest for SFURequest {
                 error: "The request body `openid_token` is missing a `access_token` or `matrix_server_name`".to_string(),
             });
         }
-        validate_delay_params(self.delay_id.as_deref(), self.delay_timeout)
+        check_delay_params(&self.delay)
     }
 }
 
@@ -460,7 +372,7 @@ async fn handle_legacy_sfu_request(
         }
     }
 
-    if let (Some(delay_id), Some(delay_timeout)) = (&payload.delay_id, payload.delay_timeout) {
+    if let Some((delay_id, delay_timeout)) = payload.delay.requested() {
         // Refuse rather than silently drop it: the client would otherwise
         // believe its deadman switch was delegated and stop restarting it.
         if !is_full_access_user {
@@ -604,7 +516,7 @@ async fn handle_sfu_request(
         }
     }
 
-    if let (Some(delay_id), Some(delay_timeout)) = (&payload.delay_id, payload.delay_timeout) {
+    if let Some((delay_id, delay_timeout)) = payload.delay.requested() {
         // Refuse rather than silently drop it: the client would otherwise
         // believe its deadman switch was delegated and stop restarting it.
         if !is_full_access_user {
