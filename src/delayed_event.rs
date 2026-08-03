@@ -175,11 +175,8 @@ struct JobHandle {
 }
 
 impl JobHandle {
-    /// Dropping a signal is equivalent to the FSM ignoring it.
-    fn send(&self, signal: Signal) {
-        if self.events.try_send(signal).is_err() {
-            debug!(?signal, "Job event channel unavailable, dropping signal");
-        }
+    async fn send(&self, signal: Signal) {
+        let _ = self.events.send(signal).await;
     }
 
     fn stop(&self) {
@@ -261,7 +258,7 @@ async fn run_job(
                 restart_deadline = Instant::now() + params.delay_timeout;
                 // Restart immediately: we do not know how much of the delay
                 // elapsed before the client handed the job over.
-                let _ = tx.try_send(Signal::DelayedEventReset);
+                restart_at = Some(Instant::now());
             }
             JobState::Disconnected => {
                 // Give ActionSend a real attempt even if the deadline has
@@ -345,7 +342,7 @@ async fn participant_lookup(params: JobParams, ctx: Arc<JobContext>, tx: mpsc::S
             return;
         }
 
-        let _ = tx.try_send(Signal::ParticipantLookupSuccessful);
+        let _ = tx.send(Signal::ParticipantLookupSuccessful).await;
 
         let Some(interval) = ctx.sanity_check_interval else {
             return;
@@ -358,7 +355,7 @@ async fn participant_lookup(params: JobParams, ctx: Arc<JobContext>, tx: mpsc::S
             // tear down a live call.
             if participant_present(auth, room, identity).await == Some(false) {
                 warn!(%room, %identity, "Participant no longer on the SFU");
-                let _ = tx.try_send(Signal::SfuParticipantGone);
+                let _ = tx.send(Signal::SfuParticipantGone).await;
                 return;
             }
         }
@@ -384,7 +381,10 @@ fn spawn_restart(
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         info!(room = %params.live_kit_room, "Restart deadline exhausted");
-        let _ = tx.try_send(Signal::DelayedEventTimedOut);
+        let tx = tx.clone();
+        background.spawn(async move {
+            let _ = tx.send(Signal::DelayedEventTimedOut).await;
+        });
         return;
     }
 
@@ -405,7 +405,7 @@ async fn restart(
 ) {
     {
         let Some(cs_api) = ctx.cs_api(&params.server_name).await else {
-            let _ = tx.try_send(Signal::CsApiUrlNotFound);
+            let _ = tx.send(Signal::CsApiUrlNotFound).await;
             return;
         };
 
@@ -420,15 +420,15 @@ async fn restart(
         {
             Ok(()) => {
                 debug!(room = %params.live_kit_room, "ActionRestart ok");
-                let _ = tx.try_send(Signal::DelayedEventRestarted);
+                let _ = tx.send(Signal::DelayedEventRestarted).await;
             }
             Err(ActionError::NotFound) => {
                 warn!(room = %params.live_kit_room, "ActionRestart: delayed event not found");
-                let _ = tx.try_send(Signal::DelayedEventNotFound);
+                let _ = tx.send(Signal::DelayedEventNotFound).await;
             }
             Err(e) => {
                 warn!(room = %params.live_kit_room, error = %e, "ActionRestart failed");
-                let _ = tx.try_send(Signal::DelayedEventTimedOut);
+                let _ = tx.send(Signal::DelayedEventTimedOut).await;
             }
         }
     }
@@ -509,6 +509,7 @@ async fn retry_action(
 pub struct DelayedEventManager {
     ctx: Arc<JobContext>,
     jobs: Arc<Mutex<HashMap<JobKey, JobHandle>>>,
+    tasks: Mutex<JoinSet<()>>,
     next_id: AtomicU64,
 }
 
@@ -518,6 +519,7 @@ impl DelayedEventManager {
         Self {
             ctx: Arc::new(ctx),
             jobs: Arc::new(Mutex::new(HashMap::new())),
+            tasks: Mutex::new(JoinSet::new()),
             next_id: AtomicU64::new(0),
         }
     }
@@ -525,7 +527,7 @@ impl DelayedEventManager {
     /// Starts a job, replacing any existing one for the same participant.
     pub async fn add_job(&self, params: JobParams) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = mpsc::channel(10);
+        let (tx, rx) = mpsc::channel(64);
         let cancel = CancellationToken::new();
 
         let handle = JobHandle {
@@ -534,12 +536,13 @@ impl DelayedEventManager {
             cancel: cancel.clone(),
         };
 
-        if let Some(previous) = self.jobs.lock().await.insert(params.key(), handle) {
-            previous.send(Signal::JobReplaced);
+        let previous = self.jobs.lock().await.insert(params.key(), handle);
+        if let Some(previous) = previous {
+            previous.send(Signal::JobReplaced).await;
             previous.stop();
         }
 
-        tokio::spawn(run_job(
+        self.tasks.lock().await.spawn(run_job(
             id,
             params,
             Arc::clone(&self.ctx),
@@ -550,6 +553,21 @@ impl DelayedEventManager {
         ));
     }
 
+    pub async fn shutdown(&self) {
+        let jobs = self.jobs.lock().await;
+        for job in jobs.values() {
+            job.stop();
+        }
+        drop(jobs);
+
+        let mut tasks = self.tasks.lock().await;
+        while tasks.join_next().await.is_some() {}
+    }
+
+    pub async fn can_delegate(&self, server_name: &str) -> bool {
+        self.ctx.cs_api(server_name).await.is_some()
+    }
+
     /// Routes an SFU webhook signal to the job for that participant, if any.
     pub async fn dispatch(&self, room: &str, identity: &str, signal: Signal) {
         let key = JobKey {
@@ -557,8 +575,16 @@ impl DelayedEventManager {
             identity: identity.to_owned(),
         };
 
-        match self.jobs.lock().await.get(&key) {
-            Some(job) => job.send(signal),
+        let events = self
+            .jobs
+            .lock()
+            .await
+            .get(&key)
+            .map(|job| job.events.clone());
+        match events {
+            Some(events) => {
+                let _ = events.send(signal).await;
+            }
             None => debug!(%room, %identity, ?signal, "No delayed event job for participant"),
         }
     }

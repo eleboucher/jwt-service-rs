@@ -133,6 +133,7 @@ async fn main() {
         resolver,
         delayed_events,
     });
+    let delayed_events = Arc::clone(&state.delayed_events);
 
     let app = build_app(state);
 
@@ -159,6 +160,7 @@ async fn main() {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .unwrap();
+    delayed_events.shutdown().await;
 }
 
 /// Handles graceful shutdown signals (Ctrl+C, SIGTERM).

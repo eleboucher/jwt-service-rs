@@ -25,11 +25,21 @@ pub fn room_alias(room_id: &str, slot_id: &str) -> String {
     hashed_id(&[room_id, slot_id])
 }
 
+#[must_use]
+pub fn legacy_room_alias(room_id: &str, slot_id: &str) -> String {
+    legacy_hashed_id(&[room_id, slot_id])
+}
+
 /// The pseudonymous LiveKit participant identity for an RTC member, so the
 /// Matrix user ID is not exposed to the SFU.
 #[must_use]
 pub fn participant_identity(user_id: &str, device_id: &str, member_id: &str) -> String {
     hashed_id(&[user_id, device_id, member_id])
+}
+
+#[must_use]
+pub fn legacy_participant_identity(user_id: &str, device_id: &str, member_id: &str) -> String {
+    legacy_hashed_id(&[user_id, device_id, member_id])
 }
 
 /// `unpadded_base64(sha256(json_serialize(parts)))`, per MSC4195.
@@ -39,7 +49,16 @@ pub fn participant_identity(user_id: &str, device_id: &str, member_id: &str) -> 
 /// LiveKit rooms.
 fn hashed_id(parts: &[&str]) -> String {
     STANDARD
-        .encode(Sha256::digest(marshal_strings(parts)))
+        .encode(Sha256::digest(
+            serde_json::to_vec(parts).expect("serializing string arrays cannot fail"),
+        ))
+        .trim_end_matches('=')
+        .to_string()
+}
+
+fn legacy_hashed_id(parts: &[&str]) -> String {
+    STANDARD
+        .encode(Sha256::digest(marshal_legacy_strings(parts)))
         .trim_end_matches('=')
         .to_string()
 }
@@ -49,7 +68,7 @@ fn hashed_id(parts: &[&str]) -> String {
 /// Go's encoder HTML-escapes `<`, `>` and `&`, and spells backspace and form
 /// feed in the `\u00XX` form. serde_json does neither, so without this an id
 /// containing one of those would hash differently here than in lk-jwt-service.
-fn marshal_strings(parts: &[&str]) -> Vec<u8> {
+fn marshal_legacy_strings(parts: &[&str]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut serializer = serde_json::Serializer::with_formatter(&mut out, GoFormatter);
 
@@ -106,10 +125,6 @@ impl serde_json::ser::Formatter for GoFormatter {
 
 /// Mints a LiveKit access token valid for an hour.
 ///
-/// `room_create` is never granted: rooms are created server-side via the
-/// RoomService API, which is what Element Call expects when the SFU runs with
-/// `auto_create: false`.
-///
 /// # Errors
 ///
 /// Returns an error if the API secret cannot be used to sign the token.
@@ -118,13 +133,15 @@ pub fn join_token(
     api_secret: &str,
     room: &str,
     identity: &str,
+    can_publish: bool,
+    room_create: bool,
 ) -> Result<String, AccessTokenError> {
     AccessToken::with_api_key(api_key, api_secret)
         .with_grants(VideoGrants {
             room: room.to_owned(),
-            room_create: false,
+            room_create,
             room_join: true,
-            can_publish: true,
+            can_publish,
             can_subscribe: true,
             can_update_own_metadata: true,
             ..Default::default()
@@ -156,12 +173,12 @@ mod tests {
         );
     }
 
-    /// Go HTML-escapes these and serde_json does not; a mismatch would put
-    /// peers in different LiveKit rooms.
+    /// Legacy aliases retain Go's HTML escaping.
     #[test]
-    fn marshal_strings_matches_go_html_escaping() {
+    fn legacy_marshal_matches_go_html_escaping() {
         let encoded =
-            String::from_utf8(marshal_strings(&["!a&b:example.com", "m.call#ROOM"])).unwrap();
+            String::from_utf8(marshal_legacy_strings(&["!a&b:example.com", "m.call#ROOM"]))
+                .unwrap();
 
         for raw in ['&', '<', '>'] {
             assert!(!encoded.contains(raw), "{raw} not escaped in {encoded}");
@@ -170,21 +187,32 @@ mod tests {
 
         // Computed by Go: json.Marshal, sha256, unpadded base64.
         assert_eq!(
-            room_alias("!a&b:example.com", "m.call#ROOM"),
+            legacy_room_alias("!a&b:example.com", "m.call#ROOM"),
             "BlPHg/JCOxLQr20ttEizBQLd7Bhh5m+r3M8rO3ejvzo"
         );
     }
 
     #[test]
-    fn marshal_strings_escapes_control_characters_like_go() {
-        let encoded = String::from_utf8(marshal_strings(&["a\u{8}b\u{c}c"])).unwrap();
+    fn canonical_json_does_not_use_legacy_html_escaping() {
+        let encoded =
+            String::from_utf8(serde_json::to_vec(&["!a&b:example.com"]).unwrap()).unwrap();
+        assert!(encoded.contains('&'), "{encoded}");
+        assert_ne!(
+            room_alias("!a&b:example.com", "m.call#ROOM"),
+            legacy_room_alias("!a&b:example.com", "m.call#ROOM")
+        );
+    }
+
+    #[test]
+    fn legacy_marshal_escapes_control_characters_like_go() {
+        let encoded = String::from_utf8(marshal_legacy_strings(&["a\u{8}b\u{c}c"])).unwrap();
 
         // Go uses the \u00XX form where serde_json would emit \b and \f.
         assert!(encoded.contains("u0008"), "{encoded}");
         assert!(encoded.contains("u000c"), "{encoded}");
         assert!(!encoded.contains('\u{8}'), "{encoded}");
 
-        let quoted = String::from_utf8(marshal_strings(&["a\"b"])).unwrap();
+        let quoted = String::from_utf8(marshal_legacy_strings(&["a\"b"])).unwrap();
         assert_eq!(quoted, r#"["a\"b"]"#);
     }
 
@@ -204,7 +232,7 @@ mod tests {
 
     #[test]
     fn join_token_grants_join_but_never_create() {
-        let jwt = join_token("devkey", "secret", "myroom", "myidentity").unwrap();
+        let jwt = join_token("devkey", "secret", "myroom", "myidentity", true, false).unwrap();
         let segments: Vec<_> = jwt.split('.').collect();
         assert_eq!(segments.len(), 3);
 
@@ -221,5 +249,32 @@ mod tests {
         assert_eq!(claims["video"]["roomCreate"], false);
         assert_eq!(claims["video"]["canPublish"], true);
         assert_eq!(claims["video"]["canSubscribe"], true);
+    }
+
+    #[test]
+    fn join_token_can_be_subscriber_only() {
+        let jwt = join_token("devkey", "secret", "myroom", "myidentity", false, false).unwrap();
+        let claims: serde_json::Value = serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(jwt.split('.').nth(1).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(claims["video"]["canPublish"], false);
+        assert_eq!(claims["video"]["canSubscribe"], true);
+    }
+
+    #[test]
+    fn join_token_can_create_a_room() {
+        let jwt = join_token("devkey", "secret", "myroom", "myidentity", true, true).unwrap();
+        let claims: serde_json::Value = serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(jwt.split('.').nth(1).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(claims["video"]["roomCreate"], true);
     }
 }

@@ -3,7 +3,7 @@ pub mod delayed_event;
 
 use axum::{
     Router,
-    extract::{Extension, Json},
+    extract::Extension,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, options},
@@ -43,7 +43,11 @@ impl AppState {
         delay_timeout_ms: i64,
         live_kit_room: &str,
         live_kit_identity: &str,
-    ) {
+    ) -> bool {
+        if !self.delayed_events.can_delegate(server_name).await {
+            return false;
+        }
+
         // The client's claim is unverifiable, so cap it. An absurd value would
         // otherwise keep a job alive indefinitely.
         let delay_timeout =
@@ -58,6 +62,8 @@ impl AppState {
                 live_kit_identity: live_kit_identity.to_owned(),
             })
             .await;
+
+        true
     }
 }
 
@@ -255,16 +261,24 @@ fn unauthorised() -> MatrixError {
 }
 
 /// New MSC4195 endpoint handler - only accepts SFURequest
-#[instrument(skip(state, payload))]
-pub async fn handle_post(
-    Extension(state): Extension<Arc<AppState>>,
-    Json(payload): Json<SFURequest>,
-) -> Response {
+#[instrument(skip(state, body))]
+pub async fn handle_post(Extension(state): Extension<Arc<AppState>>, body: String) -> Response {
     info!("Processing /get_token request");
 
     let mut headers = HeaderMap::new();
     headers.insert("Access-Control-Allow-Origin", "*".parse().unwrap());
     headers.insert("Content-Type", "application/json".parse().unwrap());
+
+    let payload = match serde_json::from_str::<SFURequest>(&body) {
+        Ok(payload) => payload,
+        Err(_) => {
+            let err = MatrixError {
+                errcode: "M_NOT_JSON".to_string(),
+                error: "Error reading request".to_string(),
+            };
+            return (StatusCode::BAD_REQUEST, headers, axum::Json(err)).into_response();
+        }
+    };
 
     if let Err(e) = payload.validate() {
         error!(errcode = %e.errcode, error = %e.error, "Validation failed");
@@ -319,9 +333,16 @@ async fn handle_legacy_sfu_request(
     // For legacy requests, derive the room alias using the same method as new requests
     // This ensures compatibility between old and new clients
     let slot_id = "m.call#ROOM";
-    let lk_room_alias = room_alias(&payload.room, slot_id);
+    let lk_room_alias = legacy_room_alias(&payload.room, slot_id);
 
-    let token = match get_join_token(&state.key, &state.secret, &lk_room_alias, &lk_identity) {
+    let token = match get_join_token(
+        &state.key,
+        &state.secret,
+        &lk_room_alias,
+        &lk_identity,
+        is_full_access_user,
+        false,
+    ) {
         Ok(t) => t,
         Err(e) => {
             error!(errcode = "M_UNKNOWN", error = %e, "Failed to generate join token");
@@ -384,7 +405,7 @@ async fn handle_legacy_sfu_request(
             return (StatusCode::BAD_REQUEST, headers, axum::Json(err)).into_response();
         }
 
-        state
+        if !state
             .delegate_delayed_leave(
                 &payload.openid_token.matrix_server_name,
                 delay_id,
@@ -392,7 +413,14 @@ async fn handle_legacy_sfu_request(
                 &lk_room_alias,
                 &lk_identity,
             )
-            .await;
+            .await
+        {
+            let err = MatrixError {
+                errcode: "M_BAD_JSON".to_string(),
+                error: "Unable to resolve client-server API".to_string(),
+            };
+            return (StatusCode::BAD_REQUEST, headers, axum::Json(err)).into_response();
+        }
     }
 
     let res = SFUResponse {
@@ -456,16 +484,23 @@ async fn handle_sfu_request(
     );
 
     // Use base64 encoded hash of user_id|device_id|member_id for identity
-    let lk_identity = participant_identity(
+    let lk_identity = legacy_participant_identity(
         &user_info.sub,
         &payload.member.claimed_device_id,
         &payload.member.id,
     );
 
     // Use base64 encoded hash of room_id|slot_id for room alias
-    let lk_room_alias = room_alias(&payload.room_id, &payload.slot_id);
+    let lk_room_alias = legacy_room_alias(&payload.room_id, &payload.slot_id);
 
-    let token = match get_join_token(&state.key, &state.secret, &lk_room_alias, &lk_identity) {
+    let token = match get_join_token(
+        &state.key,
+        &state.secret,
+        &lk_room_alias,
+        &lk_identity,
+        is_full_access_user,
+        false,
+    ) {
         Ok(t) => t,
         Err(e) => {
             error!(errcode = "M_UNKNOWN", error = %e, "Failed to generate join token");
@@ -528,7 +563,7 @@ async fn handle_sfu_request(
             return (StatusCode::BAD_REQUEST, headers, axum::Json(err)).into_response();
         }
 
-        state
+        if !state
             .delegate_delayed_leave(
                 &payload.openid_token.matrix_server_name,
                 delay_id,
@@ -536,7 +571,14 @@ async fn handle_sfu_request(
                 &lk_room_alias,
                 &lk_identity,
             )
-            .await;
+            .await
+        {
+            let err = MatrixError {
+                errcode: "M_BAD_JSON".to_string(),
+                error: "Unable to resolve client-server API".to_string(),
+            };
+            return (StatusCode::BAD_REQUEST, headers, axum::Json(err)).into_response();
+        }
     }
 
     let res = SFUResponse {
@@ -656,7 +698,9 @@ fn is_full_access_user(
 
 // The MSC4195 derivations and token minting live in jwt-service-core so a
 // homeserver can reuse them without this crate's HTTP and OpenID machinery.
-use jwt_service_core::{join_token as get_join_token, participant_identity, room_alias};
+use jwt_service_core::{
+    join_token as get_join_token, legacy_participant_identity, legacy_room_alias,
+};
 
 pub fn read_key_secret() -> (String, String) {
     let key = env::var("LIVEKIT_KEY")
@@ -698,12 +742,23 @@ pub fn read_key_secret() -> (String, String) {
 ///
 /// Hands the delayed leave event over after the client is already connected,
 /// so no JWT is issued and the LiveKit room already exists.
-#[instrument(skip(state, payload))]
+#[instrument(skip(state, body))]
 pub async fn handle_delegate_delayed_leave(
     Extension(state): Extension<Arc<AppState>>,
-    Json(payload): Json<DelegateDelayedLeaveRequest>,
+    body: String,
 ) -> Response {
     let headers = json_cors_headers();
+
+    let payload = match serde_json::from_str::<DelegateDelayedLeaveRequest>(&body) {
+        Ok(payload) => payload,
+        Err(_) => {
+            let err = MatrixError {
+                errcode: "M_NOT_JSON".to_string(),
+                error: "Error reading request".to_string(),
+            };
+            return (StatusCode::BAD_REQUEST, headers, axum::Json(err)).into_response();
+        }
+    };
 
     if let Err(e) = payload.validate() {
         error!(errcode = %e.errcode, error = %e.error, "Validation failed");
@@ -751,14 +806,14 @@ pub async fn handle_delegate_delayed_leave(
         return (StatusCode::FORBIDDEN, headers, axum::Json(err)).into_response();
     }
 
-    let lk_identity = participant_identity(
+    let lk_identity = legacy_participant_identity(
         &user_info.sub,
         &payload.member.claimed_device_id,
         &payload.member.id,
     );
-    let lk_room_alias = room_alias(&payload.room_id, &payload.slot_id);
+    let lk_room_alias = legacy_room_alias(&payload.room_id, &payload.slot_id);
 
-    state
+    if !state
         .delegate_delayed_leave(
             &payload.openid_token.matrix_server_name,
             &payload.delay_id,
@@ -766,7 +821,14 @@ pub async fn handle_delegate_delayed_leave(
             &lk_room_alias,
             &lk_identity,
         )
-        .await;
+        .await
+    {
+        let err = MatrixError {
+            errcode: "M_BAD_JSON".to_string(),
+            error: "Unable to resolve client-server API".to_string(),
+        };
+        return (StatusCode::BAD_REQUEST, headers, axum::Json(err)).into_response();
+    }
 
     (
         StatusCode::OK,
